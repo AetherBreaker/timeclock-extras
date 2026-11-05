@@ -141,13 +141,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD: ${{ needs.plan.outputs.build }}
         run: |
+          # A missing ref fails the lookup (and prints GitHub's error body on stdout, so only the exit status counts).
           for tag in $(echo "$BUILD" | jq -r '.[] | "\(.name)-v\(.version)"'); do
-            sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null || true)
-            if [ -z "$sha" ]; then
+            if sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null); then
+              [ "$sha" = "$GITHUB_SHA" ] || { echo "tag $tag already points at $sha, not $GITHUB_SHA" >&2; exit 1; }
+            else
               gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null
-            elif [ "$sha" != "$GITHUB_SHA" ]; then
-              echo "tag $tag already points at $sha, not $GITHUB_SHA" >&2
-              exit 1
             fi
           done
 
