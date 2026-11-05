@@ -1,8 +1,9 @@
 #!/bin/sh
 # Checks the patches against libfprint's pinned release (versions.toml) on Debian trixie, the image's base: libfprint's
-# virtual-image tests plus ours (identify_tests.py.in, spliced into its test class). With no argument it builds the
-# release unpatched, where a new test should fail on its bug (informational only), then patched. With `patched` it
-# builds only the patched release and fails on any failing test: the release's gate. From the repository root:
+# virtual-image tests plus ours (*.py.in here, spliced into its test class). Every build gets the test-only patches here
+# (*.patch; only libfprint/patches/ ships). With no argument it builds the release unpatched, where a new test should
+# fail on its bug (informational only), then patched. With `patched` it builds only the patched release and fails on
+# any failing test: the release's gate. From the repository root:
 #   docker run --rm -v "$PWD:/src:ro" debian:trixie sh /src/libfprint/tests/run.sh
 set -eu
 variants=${1:-unpatched patched}
@@ -17,9 +18,11 @@ echo "$sha256  /tmp/l.tar.gz" | sha256sum -c - >/dev/null
 for variant in $variants; do
   src=/tmp/$variant
   mkdir -p $src && tar -xzf /tmp/l.tar.gz -C $src --strip-components=1
+  git -C $src apply /src/libfprint/tests/*.patch
   if [ $variant = patched ]; then git -C $src apply /src/libfprint/patches/*.patch; fi
+  cat /src/libfprint/tests/*.py.in > /tmp/extra.py
   awk 'FNR==NR {extra = extra $0 "\n"; next} /^if __name__ == .__main__.:/ {printf "%s", extra} {print}' \
-    /src/libfprint/tests/identify_tests.py.in $src/tests/virtual-image.py > /tmp/vi.py && cp /tmp/vi.py $src/tests/virtual-image.py
+    /tmp/extra.py $src/tests/virtual-image.py > /tmp/vi.py && cp /tmp/vi.py $src/tests/virtual-image.py
   meson setup $src/build $src -Ddrivers=uru4000,virtual_image -Dintrospection=true -Ddoc=false -Dgtk-examples=false \
     -Dudev_rules=disabled -Dudev_hwdb=disabled >/dev/null
   ninja -C $src/build >/dev/null
