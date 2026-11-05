@@ -1,0 +1,158 @@
+# Run by `poe release` (scripts/release.py). Builds, checks, tags and publishes the wheels in versions.toml that SFTPyPI
+# lacks; a published wheel is never rebuilt (scripts/plan.py). Building runs with read-only access and no secrets; only
+# the publish job can create tags and holds the SFTPyPI credentials.
+name: "Release: build the wheels SFTPyPI lacks, check, tag and publish them"
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: "Plan: find the wheels SFTPyPI lacks"
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      # All history and tags: a published libfprint's tag records the inputs it was built from.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: uv run --frozen --no-dev python scripts/plan.py
+        id: plan
+        run: uv run --frozen --no-dev python scripts/plan.py
+
+  test-libfprint:
+    name: "Test: libfprint patches, virtual-driver suite (debian:trixie)"
+    needs: plan
+    if: contains(needs.plan.outputs.build, '"timeclock-libfprint"')
+    runs-on: ubuntu-latest
+    # Plain Debian: the suite runs on Debian's python3-gi, which the uv image's own Python would shadow.
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: sh /src/libfprint/tests/run.sh patched
+        run: ln -s "$GITHUB_WORKSPACE" /src && sh /src/libfprint/tests/run.sh patched
+
+  build:
+    name: "Build: wheel (${{ matrix.package.name }})"
+    needs: [plan, test-libfprint]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.build != '[]' }}
+    runs-on: ubuntu-latest
+    container: ${{ needs.plan.outputs.image }}
+    strategy:
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.build) }}
+    env:
+      PACKAGE: ${{ matrix.package.name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: sh scripts/build_libfprint.sh
+        if: matrix.package.name == 'timeclock-libfprint'
+        run: sh scripts/build_libfprint.sh
+
+      - name: sh scripts/build_upstream.sh ${{ matrix.package.name }}
+        if: matrix.package.name != 'timeclock-libfprint'
+        run: sh scripts/build_upstream.sh "$PACKAGE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.package.name }}
+          path: dist/${{ matrix.package.file }}
+          if-no-files-found: error
+
+  check:
+    name: "Check: install the wheels in a clean environment and load FPrint"
+    needs: [plan, build]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.build != '[]' }}
+    runs-on: ubuntu-latest
+    container: ${{ needs.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      # timeclock-system's final-stage runtime libraries, and nothing to compile with.
+      - name: apt-get install libgirepository-2.0-0 libcairo2 libgusb2 gir1.2-gusb-1.0 gir1.2-glib-2.0
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends libgirepository-2.0-0 libcairo2 libgusb2 gir1.2-gusb-1.0 gir1.2-glib-2.0
+
+      # The new wheels from dist/, the unchanged ones from SFTPyPI, at versions.toml's versions.
+      - name: uv pip install timeclock-libfprint pygobject pycairo
+        run: |
+          uv venv /tmp/v
+          uv pip install --python /tmp/v --find-links dist \
+            --index-url https://pypi.sweetfiretobacco.com/jacob.ogden/internal/+simple \
+            $(python3 -c 'import tomllib; v = tomllib.load(open("versions.toml", "rb")); print(*(f"{n}=={t["version"]}" for n, t in v.items() if n != "build"))')
+
+      - name: python scripts/smoke.py
+        env:
+          LD_LIBRARY_PATH: /tmp/v/lib
+          GI_TYPELIB_PATH: /tmp/v/lib/girepository-1.0
+        run: /tmp/v/bin/python scripts/smoke.py
+
+  publish:
+    name: "Publish: tag the commit, upload to SFTPyPI"
+    needs: [plan, check]
+    if: ${{ !failure() && !cancelled() && needs.plan.outputs.build != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      # Before the upload, so a failed upload can be re-run from the same commit.
+      - name: Each new wheel's <package>-v<version> tag points at this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ needs.plan.outputs.build }}
+        run: |
+          for tag in $(echo "$BUILD" | jq -r '.[] | "\(.name)-v\(.version)"'); do
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha 2>/dev/null || true)
+            if [ -z "$sha" ]; then
+              gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null
+            elif [ "$sha" != "$GITHUB_SHA" ]; then
+              echo "tag $tag already points at $sha, not $GITHUB_SHA" >&2
+              exit 1
+            fi
+          done
+
+      - name: uv publish --index SFTPyPI dist/*
+        env:
+          UV_PUBLISH_USERNAME: ${{ secrets.UV_INDEX_SFTPYPI_USERNAME }}
+          UV_PUBLISH_PASSWORD: ${{ secrets.UV_INDEX_SFTPYPI_PASSWORD }}
+        run: uv publish --index SFTPyPI dist/*
