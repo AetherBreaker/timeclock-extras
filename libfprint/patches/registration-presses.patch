@@ -1,0 +1,130 @@
+diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
+index 4395c4a..5cbc0aa 100644
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -435,6 +435,106 @@ fp_print_get_identify_score (FpPrint *print)
+   return print->identify_score;
+ }
+ 
++/**
++ * fp_print_score_press:
++ * @print: An NBIS #FpPrint
++ * @index: Which of @print's presses to score
++ * @other: An NBIS #FpPrint, which may be @print itself
++ * @n_scores: (out): Return location for the number of scores
++ * @error: Return location for error
++ *
++ * timeclock-system: the bozorth3 score of @print's press @index against each of @other's presses, in order, so a
++ * caller can judge single presses (registration). bozorth3 keeps its tables in globals: call this from one thread only.
++ *
++ * Returns: (array length=n_scores) (transfer full) (nullable): The scores, or %NULL with @error set
++ */
++gint *
++fp_print_score_press (FpPrint *print,
++                      guint    index,
++                      FpPrint *other,
++                      gsize   *n_scores,
++                      GError **error)
++{
++  struct xyt_struct *pstruct;
++  gint *scores;
++  gint probe_len;
++  guint i;
++
++  g_return_val_if_fail (FP_IS_PRINT (print), NULL);
++  g_return_val_if_fail (FP_IS_PRINT (other), NULL);
++  g_return_val_if_fail (n_scores != NULL, NULL);
++
++  *n_scores = 0;
++  if (print->type != FPI_PRINT_NBIS || other->type != FPI_PRINT_NBIS)
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                           "Only NBIS prints have presses to score");
++      return NULL;
++    }
++  if (index >= print->prints->len)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                   "Press %u is out of range: the print has %u", index, print->prints->len);
++      return NULL;
++    }
++
++  pstruct = g_ptr_array_index (print->prints, index);
++  probe_len = bozorth_probe_init (pstruct);
++  scores = g_new (gint, MAX (other->prints->len, 1));
++  for (i = 0; i < other->prints->len; i++)
++    scores[i] = bozorth_to_gallery (probe_len, pstruct, g_ptr_array_index (other->prints, i));
++
++  *n_scores = other->prints->len;
++  return scores;
++}
++
++/**
++ * fp_print_new_from_presses:
++ * @presses: (array length=n_presses): NBIS prints holding one press each, as identify's probe does
++ * @n_presses: The number of @presses
++ * @error: Return location for error
++ *
++ * timeclock-system: a new NBIS print holding the press of each of @presses, in order, with the first one's driver and
++ * device ID, so registration can choose its presses instead of keeping the first ones enrollment saw.
++ *
++ * Returns: (transfer full) (nullable): The new #FpPrint, or %NULL with @error set
++ */
++FpPrint *
++fp_print_new_from_presses (FpPrint **presses,
++                           guint     n_presses,
++                           GError  **error)
++{
++  FpPrint *result;
++  guint i;
++
++  if (n_presses == 0)
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "No presses given");
++      return NULL;
++    }
++  for (i = 0; i < n_presses; i++)
++    {
++      g_return_val_if_fail (FP_IS_PRINT (presses[i]), NULL);
++      if (presses[i]->type != FPI_PRINT_NBIS || presses[i]->prints->len != 1)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                       "Press %u is not an NBIS print holding one press", i);
++          return NULL;
++        }
++    }
++
++  result = g_object_new (FP_TYPE_PRINT,
++                         "driver", presses[0]->driver,
++                         "device-id", presses[0]->device_id,
++                         NULL);
++  g_object_ref_sink (result);
++  fpi_print_set_type (result, FPI_PRINT_NBIS);
++  for (i = 0; i < n_presses; i++)
++    fpi_print_add_print (result, presses[i]);
++
++  return result;
++}
++
+ /**
+  * fp_print_get_finger:
+  * @print: A #FpPrint
+diff --git a/libfprint/fp-print.h b/libfprint/fp-print.h
+index 160d520..e354e02 100644
+--- a/libfprint/fp-print.h
++++ b/libfprint/fp-print.h
+@@ -84,6 +84,14 @@ const gchar *fp_print_get_driver (FpPrint *print);
+ const gchar *fp_print_get_device_id (FpPrint *print);
+ FpImage     *fp_print_get_image (FpPrint *print);
+ gint         fp_print_get_identify_score (FpPrint *print);
++gint        *fp_print_score_press (FpPrint *print,
++                                   guint    index,
++                                   FpPrint *other,
++                                   gsize   *n_scores,
++                                   GError **error);
++FpPrint     *fp_print_new_from_presses (FpPrint **presses,
++                                        guint     n_presses,
++                                        GError  **error);
+ 
+ FpFinger     fp_print_get_finger (FpPrint *print);
+ const gchar *fp_print_get_username (FpPrint *print);

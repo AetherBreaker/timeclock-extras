@@ -7,7 +7,7 @@
 image = "ghcr.io/astral-sh/uv:python3.14-trixie-slim"
 
 [timeclock-libfprint]
-version   = "1.94.100.post2"
+version   = "1.94.100.post3"
 wheel-tag = "py3-none-linux_x86_64"
 source    = "https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz"
 sha256    = "edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c"
