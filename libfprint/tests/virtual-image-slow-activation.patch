@@ -1,0 +1,17 @@
+diff --git a/libfprint/drivers/virtual-image.c b/libfprint/drivers/virtual-image.c
+index 97eebc9..f8e2e2e 100644
+--- a/libfprint/drivers/virtual-image.c
++++ b/libfprint/drivers/virtual-image.c
+@@ -259,7 +259,11 @@ dev_activate (FpImageDevice *dev)
+   /* Start reading (again). */
+   recv_image (self);
+ 
+-  fpi_image_device_activate_complete (dev, NULL);
++  /* timeclock-system tests only: activate asynchronously, as the uru4000 does, so a cancel can land mid-activation. */
++  if (g_getenv ("TIMECLOCK_SLOW_ACTIVATION"))
++    fpi_device_add_timeout (FP_DEVICE (dev), 100, (FpTimeoutFunc) fpi_image_device_activate_complete, NULL, NULL);
++  else
++    fpi_image_device_activate_complete (dev, NULL);
+ }
+ 
+ static void
