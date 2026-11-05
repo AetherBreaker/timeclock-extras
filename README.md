@@ -23,8 +23,9 @@ published to SFTPyPI, where timeclock-system's `uv.lock` pins them by hash.
 ## libfprint patches
 
 A patch is one more `libfprint/patches/*.patch`: a `git apply` diff against the release in `versions.toml`, applied in
-sorted order on top of the others. Tests go in `libfprint/tests/identify_tests.py.in`, which is spliced into libfprint's
-virtual-image test class. Run them from the repository root:
+sorted order on top of the others. Tests go in `libfprint/tests/*.py.in`, which are spliced into libfprint's
+virtual-image test class; a test that needs the test driver changed gets a test-only `libfprint/tests/*.patch`, applied
+to every test build and never shipped. Run them from the repository root:
 
 ```sh
 docker run --rm -v "$PWD:/src:ro" debian:trixie sh /src/libfprint/tests/run.sh          # unpatched, then patched
