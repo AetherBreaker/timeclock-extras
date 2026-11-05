@@ -1,0 +1,35 @@
+    # timeclock-system: a cancel that lands while the reader is still activating ends the identify once activation
+    # completes. TIMECLOCK_SLOW_ACTIVATION (virtual-image-slow-activation.patch) gives the virtual driver the uru4000's
+    # asynchronous activation, which is where the clock's cancels were dropped (main-warehouse, 2026-11-05).
+    def test_identify_cancelled_during_activation(self):
+        fp = self.enroll_print('whorl')
+        cancel = Gio.Cancellable()
+        result = []
+        timed_out = []
+
+        def identify_cb(dev, res):
+            try:
+                result.append(dev.identify_finish(res))
+            except GLib.GError as e:
+                result.append(e)
+
+        os.environ['TIMECLOCK_SLOW_ACTIVATION'] = '1'
+        try:
+            self.dev.identify([fp], cancellable=cancel, callback=identify_cb)
+            cancel.cancel()
+            source = GLib.timeout_add(1000, lambda: timed_out.append(True))
+            while not result and not timed_out:
+                ctx.iteration(True)
+            if timed_out:
+                # The cancel was dropped and the call waits for a finger; a press ends it, as on the clock.
+                self.send_image('whorl')
+                while not result:
+                    ctx.iteration(True)
+            else:
+                GLib.source_remove(source)
+        finally:
+            del os.environ['TIMECLOCK_SLOW_ACTIVATION']
+        self.assertFalse(timed_out, 'the cancel was dropped')
+        self.assertIsInstance(result[0], GLib.GError)
+        self.assertTrue(result[0].matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED))
+

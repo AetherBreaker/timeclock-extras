@@ -1,0 +1,17 @@
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index e310608..ee1a4db 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -657,6 +657,12 @@ fpi_image_device_activate_complete (FpImageDevice *self, GError *error)
+    * state. */
+   fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_IDLE);
+   fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON);
++
++  /* timeclock-system: a cancel that arrived while activating found the device inactive, and
++   * fpi_image_device_deactivate dropped it; the cancellable can't fire again, so apply it now, as a cancel arriving
++   * while awaiting the finger is. */
++  if (fpi_device_action_is_cancelled (FP_DEVICE (self)))
++    fpi_image_device_deactivate (self, TRUE);
+ }
+ 
+ /**
