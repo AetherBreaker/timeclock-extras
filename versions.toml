@@ -1,0 +1,25 @@
+# What `poe release` builds. A wheel SFTPyPI already has is skipped, never rebuilt, so a change to a package's inputs
+# (for timeclock-libfprint: a patch, its tests, its build script or its table here) bumps that package's `version` in
+# the same PR; the release refuses an unbumped libfprint change.
+
+[build]
+# timeclock-system's image base: the wheels must load on it.
+image = "ghcr.io/astral-sh/uv:python3.14-trixie-slim"
+
+[timeclock-libfprint]
+version   = "1.94.100.post1"
+wheel-tag = "py3-none-linux_x86_64"
+source    = "https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz"
+sha256    = "edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c"
+
+[pygobject]
+version   = "3.58.1"
+wheel-tag = "cp314-cp314-linux_x86_64"
+source    = "https://files.pythonhosted.org/packages/65/1e/d590f82e14db75945b03f6b63e0f19662e0340babd8f574fdb1bb5a015e2/pygobject-3.58.1.tar.gz"
+sha256    = "4c80598ade17fbaa7798e01a25d0bf29ce109740786026a074c5c62bb3e79d23"
+
+[pycairo]
+version   = "1.29.2"
+wheel-tag = "cp314-cp314-linux_x86_64"
+source    = "https://files.pythonhosted.org/packages/bb/5e/19ab2572981a996ce96b853a189d2dcced40506b67d9555a7568457abcf2/pycairo-1.29.2.tar.gz"
+sha256    = "3e69fff74fe64f5ba2dfa31f67c6bdf26413342574047437d2ac520d35e9a489"

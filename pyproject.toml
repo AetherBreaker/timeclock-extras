@@ -1,0 +1,28 @@
+[project]
+name            = "timeclock-extras"
+version         = "0"
+description     = "Builds the timeclock's prebuilt wheels: patched libfprint, PyGObject and pycairo"
+requires-python = ">=3.14"
+dependencies    = []
+
+[dependency-groups]
+dev = ["poethepoet>=0.46.0", "pytest>=8.0"]
+
+[tool.uv]
+  # Not a package: the repo builds other packages' wheels (versions.toml).
+  package = false
+
+  [[tool.uv.index]]
+    name        = "SFTPyPI"
+    url         = "https://pypi.sweetfiretobacco.com/jacob.ogden/internal/+simple"
+    publish-url = "https://pypi.sweetfiretobacco.com/jacob.ogden/internal/"
+    explicit    = true
+
+[tool.pytest.ini_options]
+  testpaths  = ["tests"]
+  pythonpath = ["scripts"]
+  addopts   = ["--strict-markers", "--strict-config", "-ra"]
+
+[tool.poe.tasks.release]
+  help = "Run the release workflow on origin/main and wait for it: builds, checks, tags and publishes the wheels SFTPyPI lacks"
+  cmd  = "python scripts/release.py"
