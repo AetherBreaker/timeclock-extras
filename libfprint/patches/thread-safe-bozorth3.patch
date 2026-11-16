@@ -1,0 +1,387 @@
+timeclock-system: bozorth3 safe from any number of threads at once, and cancellable.
+
+bozorth3 keeps its working tables in globals, and every score is two steps over them (bozorth_probe_init fills them
+from the probe, bozorth_to_gallery reads them per comparison), so two threads matching at once overwrite each other's
+tables and return wrong scores silently. This makes every mutable table thread-local: each thread gets its own copy
+(about 47 MB once touched), allocated by the C runtime when the thread first matches. It also lets
+fp_print_score_press's caller stop a call from another thread: a GCancellable, checked before each of the other print's
+presses and in every loop whose length the minutiae decide (bz_comp, bz_match, bz_match_score's outer and inner loops,
+bz_final_loop), which return early with nothing to clean up, as their own overflow returns already do. A thread can't
+be stopped safely from outside (a kill or a signal handler jumping out can leave the allocator's or GLib's locks held
+for good), so the call stops itself.
+
+A thread's tables are freed with its thread-local block, which glibc frees only when it drops the thread's stack:
+glibc caches exited threads' stacks (40 MB of them by default) for reuse, blocks included, so a process whose matcher
+threads come and go must start with GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0, or a few exited threads' tables
+stay resident. glibc reads it once, at process start, so this library can't set it; timeclock-system's image sets it
+and its app restarts itself with it when missing. Tables on the heap, freed at thread exit, would need no setting but
+matched about 4x slower.
+
+Audit of every global and static the matcher can reach:
+- Thread-local (written while matching):
+  - bz_gbls.c, both TARGET_OS branches, with their externs in nbis/include/bozorth.h: colp, scols, fcols, scolpt,
+    fcolpt, sc, yl, rq, tq, zz, rx, mm, nn, qq, rk, cp, rp, rf, cf, bz_y.
+  - bozorth3.c, file scope: ct, gct, ctt, ctp, yy.
+  - bozorth3.c, inside functions: rot and rtp (bz_match), sct (bz_final_loop).
+- Read-only: ii_table (bozorth3.c, bz_match): an initialised constant table, never written.
+- Never written in libfprint's build:
+  - verbose_threshold: declared extern in bozorth.h, defined and used nowhere.
+  - bz_io.c's program_buffer, pfile, gfile: the command-line tool's state, only read back by get_progname,
+    get_probe_filename and get_gallery_filename; nothing in libfprint sets them.
+- bz_alloc.c, bz_drvrs.c, bz_sort.c: no globals or statics.
+- libfprint's glue (fpi-print.c's fpi_print_bz3_match), identify-best-match.patch and registration-presses.patch: locals
+  only, plus FpPrint fields (identify_score) owned by the caller's object; each thread uses its own FpPrint objects.
+- mindtct, which extracts minutiae during a capture, isn't touched: only the device's thread runs it.
+
+diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
+index 5cbc0aa..10f20c7 100644
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -435,25 +435,35 @@ fp_print_get_identify_score (FpPrint *print)
+   return print->identify_score;
+ }
+ 
++static int
++score_cancelled (void *cancellable)
++{
++  return g_cancellable_is_cancelled (G_CANCELLABLE (cancellable));
++}
++
+ /**
+  * fp_print_score_press:
+  * @print: An NBIS #FpPrint
+  * @index: Which of @print's presses to score
+  * @other: An NBIS #FpPrint, which may be @print itself
++ * @cancellable: (nullable): A #GCancellable to stop the scoring, or %NULL
+  * @n_scores: (out): Return location for the number of scores
+  * @error: Return location for error
+  *
+  * timeclock-system: the bozorth3 score of @print's press @index against each of @other's presses, in order, so a
+- * caller can judge single presses (registration). bozorth3 keeps its tables in globals: call this from one thread only.
++ * caller can judge single presses (registration). Safe from any number of threads at once: bozorth3's tables are
++ * thread-local. @cancellable is checked before each of @other's presses and inside bozorth3's long loops, so a
++ * cancel from another thread ends the call within one loop step, with %G_IO_ERROR_CANCELLED.
+  *
+  * Returns: (array length=n_scores) (transfer full) (nullable): The scores, or %NULL with @error set
+  */
+ gint *
+-fp_print_score_press (FpPrint *print,
+-                      guint    index,
+-                      FpPrint *other,
+-                      gsize   *n_scores,
+-                      GError **error)
++fp_print_score_press (FpPrint      *print,
++                      guint         index,
++                      FpPrint      *other,
++                      GCancellable *cancellable,
++                      gsize        *n_scores,
++                      GError      **error)
+ {
+   struct xyt_struct *pstruct;
+   gint *scores;
+@@ -478,11 +488,26 @@ fp_print_score_press (FpPrint *print,
+       return NULL;
+     }
+ 
++  if (g_cancellable_set_error_if_cancelled (cancellable, error))
++    return NULL;
++
+   pstruct = g_ptr_array_index (print->prints, index);
++  /* This thread's check, for this call only: the identify path, on its own thread, never sets one. */
++  bz_cancel_check = cancellable ? score_cancelled : NULL;
++  bz_cancel_data = cancellable;
+   probe_len = bozorth_probe_init (pstruct);
+   scores = g_new (gint, MAX (other->prints->len, 1));
+-  for (i = 0; i < other->prints->len; i++)
++  for (i = 0; i < other->prints->len && !g_cancellable_is_cancelled (cancellable); i++)
+     scores[i] = bozorth_to_gallery (probe_len, pstruct, g_ptr_array_index (other->prints, i));
++  bz_cancel_check = NULL;
++  bz_cancel_data = NULL;
++
++  /* A cancelled bozorth3 call returns early with a meaningless score: the whole call reports the cancel instead. */
++  if (g_cancellable_set_error_if_cancelled (cancellable, error))
++    {
++      g_free (scores);
++      return NULL;
++    }
+ 
+   *n_scores = other->prints->len;
+   return scores;
+diff --git a/libfprint/fp-print.h b/libfprint/fp-print.h
+index e354e02..ddd6fbe 100644
+--- a/libfprint/fp-print.h
++++ b/libfprint/fp-print.h
+@@ -84,11 +84,12 @@ const gchar *fp_print_get_driver (FpPrint *print);
+ const gchar *fp_print_get_device_id (FpPrint *print);
+ FpImage     *fp_print_get_image (FpPrint *print);
+ gint         fp_print_get_identify_score (FpPrint *print);
+-gint        *fp_print_score_press (FpPrint *print,
+-                                   guint    index,
+-                                   FpPrint *other,
+-                                   gsize   *n_scores,
+-                                   GError **error);
++gint        *fp_print_score_press (FpPrint      *print,
++                                   guint         index,
++                                   FpPrint      *other,
++                                   GCancellable *cancellable,
++                                   gsize        *n_scores,
++                                   GError      **error);
+ FpPrint     *fp_print_new_from_presses (FpPrint **presses,
+                                         guint     n_presses,
+                                         GError  **error);
+diff --git a/libfprint/nbis/bozorth3/bozorth3.c b/libfprint/nbis/bozorth3/bozorth3.c
+index e2e668f..afce0ab 100644
+--- a/libfprint/nbis/bozorth3/bozorth3.c
++++ b/libfprint/nbis/bozorth3/bozorth3.c
+@@ -118,6 +118,10 @@ c = &cols[0][0];
+ 
+ table_index = 0;
+ for ( k = 0; k < npoints - 1; k++ ) {
++	if ( bz_cancelled() ) {
++		*ncomparisons = 0;
++		return;				/* timeclock-system: the caller cancelled */
++	}
+ 	for ( j = k + 1; j < npoints; j++ ) {
+ 
+ 
+@@ -369,10 +373,10 @@ register int * rotptr;
+ #define ROT_SIZE_1 20000
+ #define ROT_SIZE_2 5
+ 
+-static int rot[ ROT_SIZE_1 ][ ROT_SIZE_2 ];
++static _Thread_local int rot[ ROT_SIZE_1 ][ ROT_SIZE_2 ];
+ 
+ 
+-static int * rtp[ ROT_SIZE_1 ];
++static _Thread_local int * rtp[ ROT_SIZE_1 ];
+ 
+ 
+ 
+@@ -398,6 +402,8 @@ rotptr = &rot[0][0];
+ /* Foreach sorted edge in Subject's Web ... */
+ 
+ for ( k = 1; k < probe_ptrlist_len; k++ ) {
++	if ( bz_cancelled() )
++		return 0;			/* timeclock-system: the caller cancelled */
+ 	ss = scolpt[k-1];
+ 
+ 	/* Foreach sorted edge in On-File Record's Web ... */
+@@ -593,11 +599,11 @@ return edge_pair_index;			/* Return the number of compatible edge pairs stored i
+ /* These global arrays are declared "static" as they are only used        */
+ /* between bz_match_score() & bz_final_loop()                             */
+ /**************************************************************************/
+-static int ct[ CT_SIZE ];
+-static int gct[ GCT_SIZE ];
+-static int ctt[ CTT_SIZE ];
+-static int ctp[ CTP_SIZE_1 ][ CTP_SIZE_2 ];
+-static int yy[ YY_SIZE_1 ][ YY_SIZE_2 ][ YY_SIZE_3 ];
++static _Thread_local int ct[ CT_SIZE ];
++static _Thread_local int gct[ GCT_SIZE ];
++static _Thread_local int ctt[ CTT_SIZE ];
++static _Thread_local int ctp[ CTP_SIZE_1 ][ CTP_SIZE_2 ];
++static _Thread_local int yy[ YY_SIZE_1 ][ YY_SIZE_2 ][ YY_SIZE_3 ];
+ 
+ static int    bz_final_loop( int );
+ 
+@@ -704,6 +710,8 @@ ftt = 0;
+ match_score = 0;
+ 
+ for ( k = 0; k < np - 1; k++ ) {
++	if ( bz_cancelled() )
++		return ZERO_MATCH_SCORE;	/* timeclock-system: the caller cancelled */
+ 					/* printf( "compute(): looping with k=%d\n", k ); */
+ 
+ 	if ( sc[k] )			/* If SC counter for current pair already incremented ... */
+@@ -765,6 +773,8 @@ for ( k = 0; k < np - 1; k++ ) {
+ 		kq = kx;
+ 
+ 		for ( j = 1; j < qh; j++ ) {
++			if ( bz_cancelled() )
++				return ZERO_MATCH_SCORE;	/* timeclock-system: the caller cancelled */
+ 			for ( i = kq; i < np; i++ ) {
+ 
+ 				for ( z = 1; z < 3; z++ ) {
+@@ -1683,10 +1693,12 @@ int match_score;
+ /* locally because it is only used herein.  The use of   */
+ /* "static" is required as the array will exceed the     */
+ /* stack allocation on our local systems otherwise.      */
+-static int sct[ SCT_SIZE_1 ][ SCT_SIZE_2 ];
++static _Thread_local int sct[ SCT_SIZE_1 ][ SCT_SIZE_2 ];
+ 
+ match_score = 0;
+ for ( ii = 0; ii < tp; ii++ ) {				/* For each index up to the current value of TP ... */
++		if ( bz_cancelled() )
++			return 0;		/* timeclock-system: the caller cancelled */
+ 
+ 		if ( match_score >= gct[ii] )		/* if next group total not bigger than current match_score.. */
+ 			continue;			/*		skip to next TP index */
+diff --git a/libfprint/nbis/bozorth3/bz_gbls.c b/libfprint/nbis/bozorth3/bz_gbls.c
+index ea283d8..1fafa5c 100644
+--- a/libfprint/nbis/bozorth3/bz_gbls.c
++++ b/libfprint/nbis/bozorth3/bz_gbls.c
+@@ -62,66 +62,75 @@ of the software.
+ /* General supporting global variables */
+ /**************************************************************************/
+ 
+-int colp[ COLP_SIZE_1 ][ COLP_SIZE_2 ];		/* Output from match(), this is a sorted table of compatible edge pairs containing: */
++_Thread_local int colp[ COLP_SIZE_1 ][ COLP_SIZE_2 ];		/* Output from match(), this is a sorted table of compatible edge pairs containing: */
+ 						/*	DeltaThetaKJs, Subject's K, J, then On-File's {K,J} or {J,K} depending */
+ 						/* Sorted first on Subject's point index K, */
+ 						/*	then On-File's K or J point index (depending), */
+ 						/*	lastly on Subject's J point index */
+-int scols[ SCOLS_SIZE_1 ][ COLS_SIZE_2 ];	/* Subject's pointwise comparison table containing: */
++_Thread_local int scols[ SCOLS_SIZE_1 ][ COLS_SIZE_2 ];	/* Subject's pointwise comparison table containing: */
+ 						/*	Distance,min(BetaK,BetaJ),max(BetaK,BbetaJ), K,J,ThetaKJ */
+-int fcols[ FCOLS_SIZE_1 ][ COLS_SIZE_2 ];	/* On-File Record's pointwise comparison table with: */
++_Thread_local int fcols[ FCOLS_SIZE_1 ][ COLS_SIZE_2 ];	/* On-File Record's pointwise comparison table with: */
+ 						/*	Distance,min(BetaK,BetaJ),max(BetaK,BbetaJ),K,J, ThetaKJ */
+-int * scolpt[ SCOLPT_SIZE ];			/* Subject's list of pointers to pointwise comparison rows, sorted on: */
++_Thread_local int * scolpt[ SCOLPT_SIZE ];			/* Subject's list of pointers to pointwise comparison rows, sorted on: */
+ 						/*	Distance, min(BetaK,BetaJ), then max(BetaK,BetaJ) */
+-int * fcolpt[ FCOLPT_SIZE ];			/* On-File Record's list of pointers to pointwise comparison rows sorted on: */
++_Thread_local int * fcolpt[ FCOLPT_SIZE ];			/* On-File Record's list of pointers to pointwise comparison rows sorted on: */
+ 						/*	Distance, min(BetaK,BetaJ), then max(BetaK,BetaJ) */
+-int sc[ SC_SIZE ];				/* Flags all compatible edges in the Subject's Web */
++_Thread_local int sc[ SC_SIZE ];				/* Flags all compatible edges in the Subject's Web */
+ 
+-int yl[ YL_SIZE_1 ][ YL_SIZE_2 ];
++_Thread_local int yl[ YL_SIZE_1 ][ YL_SIZE_2 ];
+ 
+ 
+ /**************************************************************************/
+ /* Globals used significantly by sift() */
+ /**************************************************************************/
+ #ifdef TARGET_OS
+-   int rq[ RQ_SIZE ];
+-   int tq[ TQ_SIZE ];
+-   int zz[ ZZ_SIZE ];
++   _Thread_local int rq[ RQ_SIZE ];
++   _Thread_local int tq[ TQ_SIZE ];
++   _Thread_local int zz[ ZZ_SIZE ];
+ 
+-   int rx[ RX_SIZE ];
+-   int mm[ MM_SIZE ];
+-   int nn[ NN_SIZE ];
++   _Thread_local int rx[ RX_SIZE ];
++   _Thread_local int mm[ MM_SIZE ];
++   _Thread_local int nn[ NN_SIZE ];
+ 
+-   int qq[ QQ_SIZE ];
++   _Thread_local int qq[ QQ_SIZE ];
+ 
+-   int rk[ RK_SIZE ];
++   _Thread_local int rk[ RK_SIZE ];
+ 
+-   int cp[ CP_SIZE ];
+-   int rp[ RP_SIZE ];
++   _Thread_local int cp[ CP_SIZE ];
++   _Thread_local int rp[ RP_SIZE ];
+ 
+-   int rf[RF_SIZE_1][RF_SIZE_2];
+-   int cf[CF_SIZE_1][CF_SIZE_2];
++   _Thread_local int rf[RF_SIZE_1][RF_SIZE_2];
++   _Thread_local int cf[CF_SIZE_1][CF_SIZE_2];
+ 
+-   int bz_y[20000];
++   _Thread_local int bz_y[20000];
+ #else
+-   int rq[ RQ_SIZE ] = {};
+-   int tq[ TQ_SIZE ] = {};
+-   int zz[ ZZ_SIZE ] = {};
++   _Thread_local int rq[ RQ_SIZE ] = {};
++   _Thread_local int tq[ TQ_SIZE ] = {};
++   _Thread_local int zz[ ZZ_SIZE ] = {};
+ 
+-   int rx[ RX_SIZE ] = {};
+-   int mm[ MM_SIZE ] = {};
+-   int nn[ NN_SIZE ] = {};
++   _Thread_local int rx[ RX_SIZE ] = {};
++   _Thread_local int mm[ MM_SIZE ] = {};
++   _Thread_local int nn[ NN_SIZE ] = {};
+ 
+-   int qq[ QQ_SIZE ] = {};
++   _Thread_local int qq[ QQ_SIZE ] = {};
+ 
+-   int rk[ RK_SIZE ] = {};
++   _Thread_local int rk[ RK_SIZE ] = {};
+ 
+-   int cp[ CP_SIZE ] = {};
+-   int rp[ RP_SIZE ] = {};
++   _Thread_local int cp[ CP_SIZE ] = {};
++   _Thread_local int rp[ RP_SIZE ] = {};
+ 
+-   int rf[RF_SIZE_1][RF_SIZE_2] = {};
+-   int cf[CF_SIZE_1][CF_SIZE_2] = {};
++   _Thread_local int rf[RF_SIZE_1][RF_SIZE_2] = {};
++   _Thread_local int cf[CF_SIZE_1][CF_SIZE_2] = {};
+ 
+-   int bz_y[20000] = {};
++   _Thread_local int bz_y[20000] = {};
+ #endif
+ 
++/* timeclock-system: every mutable table above is thread-local, so threads can match at once. A caller that wants its
++   match stoppable sets this thread's check for the duration of the call; bozorth3's long loops ask bz_cancelled(). */
++_Thread_local int (*bz_cancel_check)( void * ) = 0;
++_Thread_local void * bz_cancel_data = 0;
++
++int bz_cancelled( void )
++{
++return bz_cancel_check != 0 && bz_cancel_check( bz_cancel_data );
++}
+diff --git a/libfprint/nbis/include/bozorth.h b/libfprint/nbis/include/bozorth.h
+index fd8975b..99d815f 100644
+--- a/libfprint/nbis/include/bozorth.h
++++ b/libfprint/nbis/include/bozorth.h
+@@ -222,28 +222,32 @@ extern int verbose_threshold;
+ /* In: BZ_GBLS.C */
+ /**************************************************************************/
+ /* Global arrays supporting "core" bozorth algorithm */
+-extern int colp[ COLP_SIZE_1 ][ COLP_SIZE_2 ];
+-extern int scols[ SCOLS_SIZE_1 ][ COLS_SIZE_2 ];
+-extern int fcols[ FCOLS_SIZE_1 ][ COLS_SIZE_2 ];
+-extern int * scolpt[ SCOLPT_SIZE ];
+-extern int * fcolpt[ FCOLPT_SIZE ];
+-extern int sc[ SC_SIZE ];
+-extern int yl[ YL_SIZE_1 ][ YL_SIZE_2 ];
++extern _Thread_local int colp[ COLP_SIZE_1 ][ COLP_SIZE_2 ];
++extern _Thread_local int scols[ SCOLS_SIZE_1 ][ COLS_SIZE_2 ];
++extern _Thread_local int fcols[ FCOLS_SIZE_1 ][ COLS_SIZE_2 ];
++extern _Thread_local int * scolpt[ SCOLPT_SIZE ];
++extern _Thread_local int * fcolpt[ FCOLPT_SIZE ];
++extern _Thread_local int sc[ SC_SIZE ];
++extern _Thread_local int yl[ YL_SIZE_1 ][ YL_SIZE_2 ];
+ /* Global arrays supporting "core" bozorth algorithm continued: */
+ /*    Globals used significantly by sift() */
+-extern int rq[ RQ_SIZE ];
+-extern int tq[ TQ_SIZE ];
+-extern int zz[ ZZ_SIZE ];
+-extern int rx[ RX_SIZE ];
+-extern int mm[ MM_SIZE ];
+-extern int nn[ NN_SIZE ];
+-extern int qq[ QQ_SIZE ];
+-extern int rk[ RK_SIZE ];
+-extern int cp[ CP_SIZE ];
+-extern int rp[ RP_SIZE ];
+-extern int rf[RF_SIZE_1][RF_SIZE_2];
+-extern int cf[CF_SIZE_1][CF_SIZE_2];
+-extern int bz_y[20000];
++extern _Thread_local int rq[ RQ_SIZE ];
++extern _Thread_local int tq[ TQ_SIZE ];
++extern _Thread_local int zz[ ZZ_SIZE ];
++extern _Thread_local int rx[ RX_SIZE ];
++extern _Thread_local int mm[ MM_SIZE ];
++extern _Thread_local int nn[ NN_SIZE ];
++extern _Thread_local int qq[ QQ_SIZE ];
++extern _Thread_local int rk[ RK_SIZE ];
++extern _Thread_local int cp[ CP_SIZE ];
++extern _Thread_local int rp[ RP_SIZE ];
++extern _Thread_local int rf[RF_SIZE_1][RF_SIZE_2];
++extern _Thread_local int cf[CF_SIZE_1][CF_SIZE_2];
++extern _Thread_local int bz_y[20000];
++/* timeclock-system: the calling thread's cancellation check (bz_gbls.c). */
++extern _Thread_local int (*bz_cancel_check)( void * );
++extern _Thread_local void * bz_cancel_data;
++extern int bz_cancelled( void );
+ 
+ /**************************************************************************/
+ /**************************************************************************/

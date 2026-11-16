@@ -1,0 +1,199 @@
+    # timeclock-system: bozorth3 is thread-safe (its tables are thread-local) and cancellable, so registration can match
+    # on several threads. Prints come from the test images, shifted and turned by a seeded random source; every thread
+    # deserializes its own FpPrint objects, as the clock's matcher threads do.
+    def _thread_corpus(self):
+        import random
+        rng = random.Random(2026)
+        presses, prints = [], []
+        for name in sorted(self.prints):
+            own = [self.capture_press(name, dx=rng.randint(-6, 6), dy=rng.randint(-6, 6), angle=rng.uniform(-0.1, 0.1))
+                   for _ in range(3)]
+            presses += own
+            prints.append(FPrint.Print.new_from_presses(own[:2]))
+        probes = [bytes(p.serialize()) for p in presses]
+        others = [bytes(p.serialize()) for p in prints]
+        serial = {(i, j): tuple(FPrint.Print.deserialize(probes[i]).score_press(0, FPrint.Print.deserialize(others[j]), None))
+                  for i in range(len(probes)) for j in range(len(others))}
+        return probes, others, serial
+
+    def _score_on_threads(self, probes, others, pairs, n_threads):
+        import threading
+        results, errors, lock = {}, [], threading.Lock()
+        start = threading.Barrier(n_threads)
+
+        def work(chunk):
+            try:
+                own = {}
+
+                def obj(data):
+                    if data not in own:
+                        own[data] = FPrint.Print.deserialize(data)
+                    return own[data]
+
+                start.wait()
+                out = {(i, j): tuple(obj(probes[i]).score_press(0, obj(others[j]), None)) for i, j in chunk}
+                with lock:
+                    results.update(out)
+            except Exception as e:  # handed to the test thread below
+                errors.append(e)
+
+        threads = [threading.Thread(target=work, args=(pairs[k::n_threads],)) for k in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+        return results
+
+    # bozorth3's scores for _thread_corpus's pairs in sorted order, from a build with every other patch and not
+    # thread-safe-bozorth3.patch: moving the tables to the heap and adding the cancel checks must not change one.
+    # test_scores_match_across_threads can't see such a change, since its serial scores come from the same build.
+    _UPSTREAM_SCORES = (
+        (1492, 190), (41, 26), (28, 28), (13, 17), (191, 693), (27, 16), (20, 13), (11, 11),
+        (323, 280), (41, 24), (23, 26), (14, 14), (39, 25), (1328, 147), (18, 16), (16, 14),
+        (27, 16), (148, 923), (19, 13), (16, 14), (29, 27), (131, 121), (16, 14), (15, 15),
+        (20, 20), (18, 19), (777, 145), (10, 16), (27, 13), (18, 13), (156, 795), (9, 13),
+        (22, 23), (21, 24), (326, 213), (12, 17), (13, 11), (16, 16), (10, 9), (1181, 88),
+        (17, 11), (14, 13), (16, 14), (84, 1198), (16, 13), (13, 14), (14, 14), (55, 122),
+    )
+
+    def test_scores_match_upstream_bozorth3(self):
+        probes, others, serial = self._thread_corpus()
+        self.assertEqual(tuple(serial[k] for k in sorted(serial)), self._UPSTREAM_SCORES)
+
+    def test_scores_match_across_threads(self):
+        import random
+        probes, others, serial = self._thread_corpus()
+        rng = random.Random(7)
+        pairs = list(serial)
+        for _ in range(10):
+            rng.shuffle(pairs)
+            self.assertEqual(self._score_on_threads(probes, others, pairs, 8), serial)
+
+    def test_matching_threads_run_in_parallel(self):
+        import time
+        probes, others, serial = self._thread_corpus()
+        pairs = list(serial)
+
+        def timed(n):
+            t0 = time.monotonic()
+            self._score_on_threads(probes, others, pairs, n)
+            return time.monotonic() - t0
+
+        one, four = timed(1), timed(4)
+        self.assertLessEqual(four, 0.6 * one, f'1 thread {one:.2f} s, 4 threads {four:.2f} s')
+
+    # In a fresh process started with glibc's stack cache off, as the clock's app runs (see the patch): a thread's tables
+    # are freed only when glibc drops its stack, which the cache would put off.
+    def test_matcher_thread_memory(self):
+        import base64
+        import os
+        import subprocess
+        probes, others, serial = self._thread_corpus()
+        script = (
+            'import base64, sys, threading\n'
+            'import gi\n'
+            'gi.require_version("FPrint", "2.0")\n'
+            'from gi.repository import FPrint\n'
+            'def rss_mb():\n'
+            '    with open("/proc/self/status") as f:\n'
+            '        return next(int(line.split()[1]) / 1024 for line in f if line.startswith("VmRSS:"))\n'
+            'probe, *others = (base64.b64decode(x) for x in sys.stdin.read().split())\n'
+            'n = 6\n'
+            'before = rss_mb()\n'
+            'scored, release = threading.Barrier(n + 1), threading.Event()\n'
+            'def work():\n'
+            '    mine = FPrint.Print.deserialize(probe)\n'
+            '    for data in others:\n'
+            '        mine.score_press(0, FPrint.Print.deserialize(data), None)\n'
+            '    scored.wait()\n'
+            '    release.wait()\n'
+            'threads = [threading.Thread(target=work) for _ in range(n)]\n'
+            'for t in threads:\n'
+            '    t.start()\n'
+            'scored.wait()\n'
+            'parked = rss_mb()\n'
+            'release.set()\n'
+            'for t in threads:\n'
+            '    t.join()\n'
+            'print((parked - before) / n, rss_mb() - before)\n')
+        data = ' '.join(base64.b64encode(d).decode() for d in [probes[0], *others])
+        env = dict(os.environ, GLIBC_TUNABLES='glibc.pthread.stack_cache_size=0')
+        r = subprocess.run([sys.executable, '-c', script], input=data, capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        per_thread, retained = (float(x) for x in r.stdout.split())
+        print(f'matcher thread memory: {per_thread:.1f} MB per thread; {retained:+.1f} MB after they exit',
+              file=sys.stderr)
+        self.assertLess(per_thread, 64)
+        self.assertLess(retained, 16)
+
+    def test_new_thread_matches_after_runtime_load(self):
+        import ast
+        import base64
+        import subprocess
+        probes, others, serial = self._thread_corpus()
+        script = (
+            'import base64, sys, threading\n'
+            'import gi\n'
+            'gi.require_version("FPrint", "2.0")\n'
+            'from gi.repository import FPrint\n'
+            'a, b = (base64.b64decode(x) for x in sys.stdin.read().split())\n'
+            'out = []\n'
+            't = threading.Thread(target=lambda: out.append(list(\n'
+            '    FPrint.Print.deserialize(a).score_press(0, FPrint.Print.deserialize(b), None))))\n'
+            't.start()\n'
+            't.join()\n'
+            'print(out[0])\n')
+        data = base64.b64encode(probes[0]).decode() + ' ' + base64.b64encode(others[0]).decode()
+        r = subprocess.run([sys.executable, '-c', script], input=data, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(tuple(ast.literal_eval(r.stdout.strip())), serial[(0, 0)])
+
+    def test_cancel_before_start(self):
+        import time
+        probes, others, serial = self._thread_corpus()
+        cancellable = Gio.Cancellable()
+        cancellable.cancel()
+        probe, other = FPrint.Print.deserialize(probes[0]), FPrint.Print.deserialize(others[0])
+        t0 = time.monotonic()
+        with self.assertRaises(GLib.Error) as cm:
+            probe.score_press(0, other, cancellable)
+        self.assertLess(time.monotonic() - t0, 0.005)
+        self.assertTrue(cm.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED))
+
+    def test_cancel_mid_match(self):
+        import threading
+        import time
+        probes, others, serial = self._thread_corpus()
+        pairs = list(serial)
+        presses = [FPrint.Print.deserialize(data) for data in probes]
+        big = FPrint.Print.new_from_presses(presses * 8)
+        cancellable, cancelled_at, side = Gio.Cancellable(), [], {}
+
+        def cancel():
+            cancelled_at.append(time.monotonic())
+            cancellable.cancel()
+
+        neighbours = threading.Thread(target=lambda: side.update(self._score_on_threads(probes, others, pairs, 4)))
+        neighbours.start()
+        timer = threading.Timer(0.05, cancel)
+        timer.start()
+        with self.assertRaises(GLib.Error) as cm:
+            presses[0].score_press(0, big, cancellable)
+        returned = time.monotonic()
+        timer.join()
+        self.assertTrue(cm.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED))
+        self.assertLess(returned - cancelled_at[0], 0.02)
+        again = {(i, j): tuple(FPrint.Print.deserialize(probes[i]).score_press(0, FPrint.Print.deserialize(others[j]), None))
+                 for i, j in pairs[:20]}
+        self.assertEqual(again, {k: serial[k] for k in pairs[:20]})
+        neighbours.join()
+        self.assertEqual(side, serial)
+
+    def test_score_press_without_cancellable(self):
+        probes, others, serial = self._thread_corpus()
+        probe, other = FPrint.Print.deserialize(probes[1]), FPrint.Print.deserialize(others[1])
+        self.assertEqual(tuple(probe.score_press(0, other, None)), tuple(probe.score_press(0, other, Gio.Cancellable())))
+        self.assertEqual(tuple(probe.score_press(0, other, None)), serial[(1, 1)])
+

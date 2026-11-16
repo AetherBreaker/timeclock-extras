@@ -5,7 +5,7 @@ compiles nothing:
 
 | Package | What it is |
 | --- | --- |
-| `timeclock-libfprint` | libfprint, built with the patches in `libfprint/patches/` (uru4000 driver only), with its `FPrint-2.0` typelib. The wheel puts `libfprint-2.so.2` and `girepository-1.0/FPrint-2.0.typelib` in the environment's `lib/`; the image points `LD_LIBRARY_PATH` and `GI_TYPELIB_PATH` there. Versioned as upstream's release plus our revision (`1.94.100.post1`, `.post2`, …). |
+| `timeclock-libfprint` | libfprint, built with the patches in `libfprint/patches/` (uru4000 driver only), with its `FPrint-2.0` typelib. The wheel puts `libfprint-2.so.2` and `girepository-1.0/FPrint-2.0.typelib` in the environment's `lib/`; the image points `LD_LIBRARY_PATH` and `GI_TYPELIB_PATH` there. Versioned as upstream's release plus our revision (`1.94.100.post1`, `.post2`, …). Its matcher is thread-safe with thread-local tables (`thread-safe-bozorth3.patch`, about 47 MB a matching thread): a process whose matching threads come and go must start with `GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0`, or glibc's thread-stack cache keeps ended threads' tables resident. |
 | `pygobject`, `pycairo` | Upstream's releases, built unmodified, under their own names and versions. |
 
 All three are built on Debian trixie (`versions.toml`'s `[build].image`, timeclock-system's base), x86-64 only, and
@@ -32,7 +32,9 @@ docker run --rm -v "$PWD:/src:ro" debian:trixie sh /src/libfprint/tests/run.sh  
 docker run --rm -v "$PWD:/src:ro" debian:trixie sh /src/libfprint/tests/run.sh patched  # the release's gate
 ```
 
-The unpatched run shows whether a new test catches its bug; only the patched run gates a release.
+The unpatched run shows whether a new test catches its bug; only the patched run gates a release. A test of a patch
+that builds on another (one calling a function an earlier patch adds) is shown failing with every patch but its own:
+`sh /src/libfprint/tests/run.sh except:<name>.patch`.
 
 ## Licenses and sources
 
