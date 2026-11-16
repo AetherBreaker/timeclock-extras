@@ -3,7 +3,9 @@
 # virtual-image tests plus ours (*.py.in here, spliced into its test class). Every build gets the test-only patches here
 # (*.patch; only libfprint/patches/ ships). With no argument it builds the release unpatched, where a new test should
 # fail on its bug (informational only), then patched. With `patched` it builds only the patched release and fails on
-# any failing test: the release's gate. From the repository root:
+# any failing test: the release's gate. With `except:<name>.patch` it builds every patch but that one (informational,
+# like unpatched): how a new patch's tests are shown to catch its bug when they need the other patches. Tests run one at
+# a time, so the thread tests' timings measure the build alone. From the repository root:
 #   docker run --rm -v "$PWD:/src:ro" debian:trixie sh /src/libfprint/tests/run.sh
 set -eu
 variants=${1:-unpatched patched}
@@ -16,10 +18,16 @@ EOF
 curl -fsSL -o /tmp/l.tar.gz "$source"
 echo "$sha256  /tmp/l.tar.gz" | sha256sum -c - >/dev/null
 for variant in $variants; do
-  src=/tmp/$variant
+  src=/tmp/$(echo $variant | tr : _)
   mkdir -p $src && tar -xzf /tmp/l.tar.gz -C $src --strip-components=1
   git -C $src apply /src/libfprint/tests/*.patch
-  if [ $variant = patched ]; then git -C $src apply /src/libfprint/patches/*.patch; fi
+  case $variant in
+    patched) git -C $src apply /src/libfprint/patches/*.patch ;;
+    except:*)
+      for patch in /src/libfprint/patches/*.patch; do
+        if [ "$(basename $patch)" != "${variant#except:}" ]; then git -C $src apply $patch; fi
+      done ;;
+  esac
   cat /src/libfprint/tests/*.py.in > /tmp/extra.py
   awk 'FNR==NR {extra = extra $0 "\n"; next} /^if __name__ == .__main__.:/ {printf "%s", extra} {print}' \
     /tmp/extra.py $src/tests/virtual-image.py > /tmp/vi.py && cp /tmp/vi.py $src/tests/virtual-image.py
@@ -28,8 +36,8 @@ for variant in $variants; do
   ninja -C $src/build >/dev/null
   echo "===== $variant"
   if [ "$variants" = patched ]; then
-    meson test -C $src/build --suite virtual-driver --timeout-multiplier 4 --print-errorlogs
+    meson test -C $src/build --suite virtual-driver --timeout-multiplier 4 --num-processes 1 --print-errorlogs
   else
-    meson test -C $src/build --suite virtual-driver --timeout-multiplier 4 --verbose 2>&1 | grep -E "identify: best|VirtualImage.test_.* (OK|FAIL|TIMEOUT)|^Ok:|^Fail:|^Timeout:" || true
+    meson test -C $src/build --suite virtual-driver --timeout-multiplier 4 --num-processes 1 --verbose 2>&1 | grep -E "identify: best|matcher thread memory|VirtualImage.test_.* (OK|FAIL|TIMEOUT)|^Ok:|^Fail:|^Timeout:" || true
   fi
 done
